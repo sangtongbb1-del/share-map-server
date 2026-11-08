@@ -7,8 +7,14 @@ const server = http.createServer((req, res) => {
     res.end("Share Map Server Online");
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({
+    server,
+    maxPayload: 5 * 1024 * 1024,
+    perMessageDeflate: false
+});
+
 const rooms = new Map();
+const MAX_MEMBERS = 5;
 
 function send(ws, data) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -49,10 +55,34 @@ function leaveRoom(ws) {
     }
 }
 
+function relayBinary(ws, message) {
+    const room = ws.room;
+    if (!room || !rooms.has(room)) return;
+
+    const state = rooms.get(room);
+    if (state.sharer !== ws) return;
+
+    for (const client of state.members) {
+        if (client === ws) continue;
+        if (client.readyState !== WebSocket.OPEN) continue;
+        if (client.bufferedAmount > 512 * 1024) continue;
+
+        client.send(message, {
+            binary: true,
+            compress: false
+        });
+    }
+}
+
 wss.on("connection", (ws) => {
     ws.room = null;
 
-    ws.on("message", (message) => {
+    ws.on("message", (message, isBinary) => {
+        if (isBinary) {
+            relayBinary(ws, message);
+            return;
+        }
+
         try {
             const data = JSON.parse(message.toString());
 
@@ -76,12 +106,11 @@ wss.on("connection", (ws) => {
 
                 const state = rooms.get(data.room);
 
-                if (state.members.size >= 3) {
+                if (state.members.size >= MAX_MEMBERS) {
                     send(ws, {
                         type: "error",
-                        message: "Phòng đã đủ 3 người"
+                        message: "Phòng đã đủ 5 người"
                     });
-
                     return;
                 }
 
@@ -105,7 +134,6 @@ wss.on("connection", (ws) => {
             if (data.type === "claim") {
                 if (state.sharer === null) {
                     state.sharer = ws;
-
                     send(ws, { type: "share_granted" });
                     broadcastState(room);
                 } else if (state.sharer === ws) {
@@ -131,12 +159,14 @@ wss.on("connection", (ws) => {
                 if (typeof data.image !== "string") return;
 
                 for (const client of state.members) {
-                    if (client !== ws) {
-                        send(client, {
-                            type: "map",
-                            image: data.image
-                        });
-                    }
+                    if (client === ws) continue;
+                    if (client.readyState !== WebSocket.OPEN) continue;
+                    if (client.bufferedAmount > 1024 * 1024) continue;
+
+                    send(client, {
+                        type: "map",
+                        image: data.image
+                    });
                 }
 
                 return;
