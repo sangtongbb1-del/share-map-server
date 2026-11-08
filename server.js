@@ -1,16 +1,17 @@
 
 const WebSocket = require("ws");
 const http = require("http");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 10000;
 const MAX_MEMBERS = 5;
-const MAX_PAYLOAD = 2 * 1024 * 1024;
+const MAX_PAYLOAD = 256 * 1024;
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/plain"
     });
-    res.end("Share Map Server Online");
+    res.end("Share Map Signaling Server Online");
 });
 
 const wss = new WebSocket.Server({
@@ -32,18 +33,15 @@ function getRoom(ws) {
 }
 
 function broadcast(room, data, exclude = null) {
-    for (const client of room.members) {
-        if (
-            client !== exclude &&
-            client.readyState === WebSocket.OPEN
-        ) {
-            client.send(JSON.stringify(data));
+    for (const client of room.members.values()) {
+        if (client !== exclude) {
+            sendJson(client, data);
         }
     }
 }
 
 function broadcastShareState(room) {
-    for (const client of room.members) {
+    for (const client of room.members.values()) {
         sendJson(client, {
             type: "share_state",
             busy: room.sharer !== null,
@@ -56,12 +54,20 @@ function leaveRoom(ws) {
     const room = getRoom(ws);
     if (!room) return;
 
+    const leavingId = ws.id;
+
     if (room.sharer === ws) {
         room.sharer = null;
     }
 
-    room.members.delete(ws);
+    room.members.delete(leavingId);
     ws.room = null;
+    ws.id = null;
+
+    broadcast(room, {
+        type: "peer_left",
+        id: leavingId
+    });
 
     if (room.members.size > 0) {
         broadcastShareState(room);
@@ -72,27 +78,14 @@ function leaveRoom(ws) {
 
 wss.on("connection", (ws) => {
     ws.room = null;
+    ws.id = crypto.randomUUID();
 
     ws.on("message", (message, isBinary) => {
-        const room = getRoom(ws);
-
-        // Nhận và chuyển tiếp dữ liệu H.264 dạng Binary.
         if (isBinary) {
-            if (!room || room.sharer !== ws) {
-                return;
-            }
-
-            for (const client of room.members) {
-                if (
-                    client !== ws &&
-                    client.readyState === WebSocket.OPEN
-                ) {
-                    client.send(message, {
-                        binary: true
-                    });
-                }
-            }
-
+            sendJson(ws, {
+                type: "error",
+                message: "Server chỉ xử lý signaling, không nhận video"
+            });
             return;
         }
 
@@ -107,6 +100,8 @@ wss.on("connection", (ws) => {
             });
             return;
         }
+
+        const room = getRoom(ws);
 
         switch (data.type) {
 
@@ -129,7 +124,7 @@ wss.on("connection", (ws) => {
                 if (!targetRoom) {
                     targetRoom = {
                         name: data.room,
-                        members: new Set(),
+                        members: new Map(),
                         sharer: null
                     };
 
@@ -141,23 +136,51 @@ wss.on("connection", (ws) => {
                         type: "error",
                         message: "Phòng đã đủ 5 thiết bị"
                     });
+
+                    if (targetRoom.members.size === 0) {
+                        rooms.delete(data.room);
+                    }
+
                     return;
                 }
 
-                targetRoom.members.add(ws);
+                ws.id = crypto.randomUUID();
                 ws.room = data.room;
+
+                const existingMembers = [];
+
+                for (const member of targetRoom.members.values()) {
+                    existingMembers.push({
+                        id: member.id
+                    });
+                }
+
+                targetRoom.members.set(ws.id, ws);
 
                 sendJson(ws, {
                     type: "joined",
-                    room: data.room
+                    room: data.room,
+                    id: ws.id,
+                    members: existingMembers
                 });
+
+                broadcast(targetRoom, {
+                    type: "peer_joined",
+                    id: ws.id
+                }, ws);
 
                 broadcastShareState(targetRoom);
                 break;
             }
 
             case "claim": {
-                if (!room) return;
+                if (!room) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Bạn chưa vào phòng"
+                    });
+                    return;
+                }
 
                 if (
                     room.sharer === null ||
@@ -184,33 +207,68 @@ wss.on("connection", (ws) => {
 
                 if (room.sharer === ws) {
                     room.sharer = null;
+
+                    broadcast(room, {
+                        type: "share_stopped",
+                        id: ws.id
+                    }, ws);
+
                     broadcastShareState(room);
                 }
 
                 break;
             }
 
-            case "map": {
-                if (!room) return;
-
-                if (
-                    room.sharer !== null &&
-                    room.sharer !== ws
-                ) {
+            case "signal": {
+                if (!room) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Bạn chưa vào phòng"
+                    });
                     return;
                 }
 
-                for (const client of room.members) {
-                    if (
-                        client !== ws &&
-                        client.readyState === WebSocket.OPEN
-                    ) {
-                        sendJson(client, {
-                            type: "map",
-                            image: data.image
-                        });
-                    }
+                const targetId = data.to;
+                const target = room.members.get(targetId);
+
+                if (!target || target === ws) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Thiết bị nhận không tồn tại"
+                    });
+                    return;
                 }
+
+                if (
+                    !data.signal ||
+                    typeof data.signal !== "object" ||
+                    !["offer", "answer", "ice"].includes(
+                        data.signal.type
+                    )
+                ) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Gói signaling không hợp lệ"
+                    });
+                    return;
+                }
+
+                if (
+                    data.signal.type === "offer" &&
+                    room.sharer !== ws
+                ) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Chỉ thiết bị đang chia sẻ được gửi Offer"
+                    });
+                    return;
+                }
+
+                sendJson(target, {
+                    type: "signal",
+                    from: ws.id,
+                    signal: data.signal
+                });
 
                 break;
             }
@@ -218,8 +276,17 @@ wss.on("connection", (ws) => {
             case "hide": {
                 if (!room) return;
 
+                if (room.sharer !== ws) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "Bạn không có quyền chia sẻ"
+                    });
+                    return;
+                }
+
                 broadcast(room, {
-                    type: "hide"
+                    type: "hide",
+                    id: ws.id
                 }, ws);
 
                 break;
@@ -244,5 +311,7 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Share Map Server running on port " + PORT);
+    console.log(
+        "Share Map Signaling Server running on port " + PORT
+    );
 });
