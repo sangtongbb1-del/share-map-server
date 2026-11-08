@@ -2,75 +2,71 @@
 const WebSocket = require("ws");
 const http = require("http");
 
+const PORT = process.env.PORT || 10000;
+const MAX_MEMBERS = 5;
+const MAX_PAYLOAD = 2 * 1024 * 1024;
+
 const server = http.createServer((req, res) => {
-    res.writeHead(200);
+    res.writeHead(200, {
+        "Content-Type": "text/plain"
+    });
     res.end("Share Map Server Online");
 });
 
 const wss = new WebSocket.Server({
     server,
-    maxPayload: 5 * 1024 * 1024,
-    perMessageDeflate: false
+    maxPayload: MAX_PAYLOAD
 });
 
 const rooms = new Map();
-const MAX_MEMBERS = 5;
 
-function send(ws, data) {
+function sendJson(ws, data) {
     if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
     }
 }
 
-function broadcastState(room) {
-    const state = rooms.get(room);
-    if (!state) return;
+function getRoom(ws) {
+    if (!ws.room) return null;
+    return rooms.get(ws.room) || null;
+}
 
-    for (const client of state.members) {
-        send(client, {
+function broadcast(room, data, exclude = null) {
+    for (const client of room.members) {
+        if (
+            client !== exclude &&
+            client.readyState === WebSocket.OPEN
+        ) {
+            client.send(JSON.stringify(data));
+        }
+    }
+}
+
+function broadcastShareState(room) {
+    for (const client of room.members) {
+        sendJson(client, {
             type: "share_state",
-            busy: state.sharer !== null,
-            mine: state.sharer === client
+            busy: room.sharer !== null,
+            mine: room.sharer === client
         });
     }
 }
 
 function leaveRoom(ws) {
-    const room = ws.room;
-    if (!room || !rooms.has(room)) return;
+    const room = getRoom(ws);
+    if (!room) return;
 
-    const state = rooms.get(room);
-    state.members.delete(ws);
-
-    if (state.sharer === ws) {
-        state.sharer = null;
+    if (room.sharer === ws) {
+        room.sharer = null;
     }
 
+    room.members.delete(ws);
     ws.room = null;
 
-    if (state.members.size === 0) {
-        rooms.delete(room);
+    if (room.members.size > 0) {
+        broadcastShareState(room);
     } else {
-        broadcastState(room);
-    }
-}
-
-function relayBinary(ws, message) {
-    const room = ws.room;
-    if (!room || !rooms.has(room)) return;
-
-    const state = rooms.get(room);
-    if (state.sharer !== ws) return;
-
-    for (const client of state.members) {
-        if (client === ws) continue;
-        if (client.readyState !== WebSocket.OPEN) continue;
-        if (client.bufferedAmount > 512 * 1024) continue;
-
-        client.send(message, {
-            binary: true,
-            compress: false
-        });
+        rooms.delete(room.name);
     }
 }
 
@@ -78,17 +74,48 @@ wss.on("connection", (ws) => {
     ws.room = null;
 
     ws.on("message", (message, isBinary) => {
+        const room = getRoom(ws);
+
+        // Nhận và chuyển tiếp dữ liệu H.264 dạng Binary.
         if (isBinary) {
-            relayBinary(ws, message);
+            if (!room || room.sharer !== ws) {
+                return;
+            }
+
+            for (const client of room.members) {
+                if (
+                    client !== ws &&
+                    client.readyState === WebSocket.OPEN
+                ) {
+                    client.send(message, {
+                        binary: true
+                    });
+                }
+            }
+
             return;
         }
 
-        try {
-            const data = JSON.parse(message.toString());
+        let data;
 
-            if (data.type === "join") {
-                if (!/^\d{6}$/.test(data.room)) {
-                    send(ws, {
+        try {
+            data = JSON.parse(message.toString());
+        } catch (error) {
+            sendJson(ws, {
+                type: "error",
+                message: "Dữ liệu JSON không hợp lệ"
+            });
+            return;
+        }
+
+        switch (data.type) {
+
+            case "join": {
+                if (
+                    typeof data.room !== "string" ||
+                    !/^\d{6}$/.test(data.room)
+                ) {
+                    sendJson(ws, {
                         type: "error",
                         message: "Mã phòng không hợp lệ"
                     });
@@ -97,96 +124,113 @@ wss.on("connection", (ws) => {
 
                 leaveRoom(ws);
 
-                if (!rooms.has(data.room)) {
-                    rooms.set(data.room, {
+                let targetRoom = rooms.get(data.room);
+
+                if (!targetRoom) {
+                    targetRoom = {
+                        name: data.room,
                         members: new Set(),
                         sharer: null
-                    });
+                    };
+
+                    rooms.set(data.room, targetRoom);
                 }
 
-                const state = rooms.get(data.room);
-
-                if (state.members.size >= MAX_MEMBERS) {
-                    send(ws, {
+                if (targetRoom.members.size >= MAX_MEMBERS) {
+                    sendJson(ws, {
                         type: "error",
-                        message: "Phòng đã đủ 5 người"
+                        message: "Phòng đã đủ 5 thiết bị"
                     });
                     return;
                 }
 
+                targetRoom.members.add(ws);
                 ws.room = data.room;
-                state.members.add(ws);
 
-                send(ws, {
+                sendJson(ws, {
                     type: "joined",
                     room: data.room
                 });
 
-                broadcastState(data.room);
-                return;
+                broadcastShareState(targetRoom);
+                break;
             }
 
-            const room = ws.room;
-            if (!room || !rooms.has(room)) return;
+            case "claim": {
+                if (!room) return;
 
-            const state = rooms.get(room);
+                if (
+                    room.sharer === null ||
+                    room.sharer === ws
+                ) {
+                    room.sharer = ws;
 
-            if (data.type === "claim") {
-                if (state.sharer === null) {
-                    state.sharer = ws;
-                    send(ws, { type: "share_granted" });
-                    broadcastState(room);
-                } else if (state.sharer === ws) {
-                    send(ws, { type: "share_granted" });
+                    sendJson(ws, {
+                        type: "share_granted"
+                    });
+
+                    broadcastShareState(room);
                 } else {
-                    send(ws, { type: "share_denied" });
-                }
-
-                return;
-            }
-
-            if (data.type === "release") {
-                if (state.sharer === ws) {
-                    state.sharer = null;
-                    broadcastState(room);
-                }
-
-                return;
-            }
-
-            if (data.type === "map") {
-                if (state.sharer !== ws) return;
-                if (typeof data.image !== "string") return;
-
-                for (const client of state.members) {
-                    if (client === ws) continue;
-                    if (client.readyState !== WebSocket.OPEN) continue;
-                    if (client.bufferedAmount > 1024 * 1024) continue;
-
-                    send(client, {
-                        type: "map",
-                        image: data.image
+                    sendJson(ws, {
+                        type: "share_denied"
                     });
                 }
 
-                return;
+                break;
             }
 
-            if (data.type === "hide") {
-                if (state.sharer !== ws) return;
+            case "release": {
+                if (!room) return;
 
-                for (const client of state.members) {
-                    if (client !== ws) {
-                        send(client, { type: "hide" });
+                if (room.sharer === ws) {
+                    room.sharer = null;
+                    broadcastShareState(room);
+                }
+
+                break;
+            }
+
+            case "map": {
+                if (!room) return;
+
+                if (
+                    room.sharer !== null &&
+                    room.sharer !== ws
+                ) {
+                    return;
+                }
+
+                for (const client of room.members) {
+                    if (
+                        client !== ws &&
+                        client.readyState === WebSocket.OPEN
+                    ) {
+                        sendJson(client, {
+                            type: "map",
+                            image: data.image
+                        });
                     }
                 }
+
+                break;
             }
 
-        } catch (error) {
-            send(ws, {
-                type: "error",
-                message: "Dữ liệu không hợp lệ"
-            });
+            case "hide": {
+                if (!room) return;
+
+                broadcast(room, {
+                    type: "hide"
+                }, ws);
+
+                break;
+            }
+
+            default: {
+                sendJson(ws, {
+                    type: "error",
+                    message: "Lệnh không được hỗ trợ"
+                });
+            }
         }
     });
 
@@ -194,13 +238,11 @@ wss.on("connection", (ws) => {
         leaveRoom(ws);
     });
 
-    ws.on("error", () => {
-        leaveRoom(ws);
+    ws.on("error", (error) => {
+        console.error("WebSocket error:", error.message);
     });
 });
 
-const PORT = process.env.PORT || 10000;
-
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Share Map running on port " + PORT);
+    console.log("Share Map Server running on port " + PORT);
 });
