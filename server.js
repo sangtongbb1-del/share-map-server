@@ -1,4 +1,3 @@
-
 const WebSocket = require("ws");
 const http = require("http");
 const crypto = require("crypto");
@@ -52,15 +51,23 @@ function broadcastShareState(room) {
 
 function leaveRoom(ws) {
     const room = getRoom(ws);
-    if (!room) return;
+    if (!room || !ws.id) return;
 
     const leavingId = ws.id;
+
+    // Chỉ xử lý nếu socket thực sự thuộc phòng.
+    if (room.members.get(leavingId) !== ws) {
+        ws.room = null;
+        ws.id = null;
+        return;
+    }
 
     if (room.sharer === ws) {
         room.sharer = null;
     }
 
     room.members.delete(leavingId);
+
     ws.room = null;
     ws.id = null;
 
@@ -136,10 +143,6 @@ wss.on("connection", (ws) => {
                         type: "error",
                         message: "Phòng đã đủ 5 thiết bị"
                     });
-
-                    if (targetRoom.members.size === 0) {
-                        rooms.delete(data.room);
-                    }
 
                     return;
                 }
