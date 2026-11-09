@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 10000;
 const MAX_MEMBERS = 5;
 const MAX_PAYLOAD = 256 * 1024;
+const RECONNECT_TTL = 24 * 60 * 60 * 1000;
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, {
@@ -21,7 +22,7 @@ const wss = new WebSocket.Server({
 const rooms = new Map();
 
 function sendJson(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
     }
 }
@@ -33,47 +34,52 @@ function getRoom(ws) {
 
 function broadcast(room, data, exclude = null) {
     for (const client of room.members.values()) {
-        if (client !== exclude) {
+        if (client && client !== exclude) {
             sendJson(client, data);
         }
     }
 }
 
 function broadcastShareState(room) {
-    for (const client of room.members.values()) {
+    for (const [id, client] of room.members.entries()) {
+        if (!client) continue;
+
         sendJson(client, {
             type: "share_state",
-            busy: room.sharer !== null,
-            mine: room.sharer === client
+            busy: room.sharerId !== null,
+            mine: room.sharerId === id
         });
     }
 }
 
-function leaveRoom(ws) {
-    const room = getRoom(ws);
-    if (!room || !ws.id) return;
+function createRoom(name) {
+    return {
+        name,
+        members: new Map(),
+        memberTimers: new Map(),
+        sharerId: null
+    };
+}
 
-    const leavingId = ws.id;
+function removeMember(room, id) {
+    if (!room || !room.members.has(id)) return;
 
-    // Chỉ xử lý nếu socket thực sự thuộc phòng.
-    if (room.members.get(leavingId) !== ws) {
-        ws.room = null;
-        ws.id = null;
-        return;
+    const timer = room.memberTimers.get(id);
+
+    if (timer) {
+        clearTimeout(timer);
+        room.memberTimers.delete(id);
     }
 
-    if (room.sharer === ws) {
-        room.sharer = null;
+    room.members.delete(id);
+
+    if (room.sharerId === id) {
+        room.sharerId = null;
     }
-
-    room.members.delete(leavingId);
-
-    ws.room = null;
-    ws.id = null;
 
     broadcast(room, {
         type: "peer_left",
-        id: leavingId
+        id
     });
 
     if (room.members.size > 0) {
@@ -83,9 +89,65 @@ function leaveRoom(ws) {
     }
 }
 
+function leaveRoom(ws) {
+    const room = getRoom(ws);
+    if (!room || !ws.id) return;
+
+    const id = ws.id;
+
+    if (room.members.get(id) === ws) {
+        removeMember(room, id);
+    }
+
+    ws.room = null;
+    ws.id = null;
+}
+
+function handleDisconnect(ws) {
+    const room = getRoom(ws);
+    if (!room || !ws.id) return;
+
+    const id = ws.id;
+
+    if (room.members.get(id) !== ws) return;
+
+    // Giữ chỗ thiết bị trong phòng để có thể kết nối lại.
+    room.members.set(id, null);
+
+    broadcast(room, {
+        type: "peer_left",
+        id
+    });
+
+    broadcastShareState(room);
+
+    const oldTimer = room.memberTimers.get(id);
+
+    if (oldTimer) {
+        clearTimeout(oldTimer);
+    }
+
+    const timer = setTimeout(() => {
+        const currentRoom = rooms.get(room.name);
+
+        if (
+            currentRoom &&
+            currentRoom.members.has(id) &&
+            currentRoom.members.get(id) === null
+        ) {
+            removeMember(currentRoom, id);
+        }
+    }, RECONNECT_TTL);
+
+    room.memberTimers.set(id, timer);
+
+    ws.room = null;
+    ws.id = null;
+}
+
 wss.on("connection", (ws) => {
     ws.room = null;
-    ws.id = crypto.randomUUID();
+    ws.id = null;
 
     ws.on("message", (message, isBinary) => {
         if (isBinary) {
@@ -124,53 +186,80 @@ wss.on("connection", (ws) => {
                     return;
                 }
 
+                if (
+                    typeof data.deviceId !== "string" ||
+                    !/^[a-zA-Z0-9-]{8,64}$/.test(data.deviceId)
+                ) {
+                    sendJson(ws, {
+                        type: "error",
+                        message: "ID thiết bị không hợp lệ"
+                    });
+                    return;
+                }
+
                 leaveRoom(ws);
 
                 let targetRoom = rooms.get(data.room);
 
                 if (!targetRoom) {
-                    targetRoom = {
-                        name: data.room,
-                        members: new Map(),
-                        sharer: null
-                    };
-
+                    targetRoom = createRoom(data.room);
                     rooms.set(data.room, targetRoom);
                 }
 
-                if (targetRoom.members.size >= MAX_MEMBERS) {
+                const deviceId = data.deviceId;
+                const existingDevice = targetRoom.members.has(deviceId);
+
+                if (
+                    !existingDevice &&
+                    targetRoom.members.size >= MAX_MEMBERS
+                ) {
                     sendJson(ws, {
                         type: "error",
                         message: "Phòng đã đủ 5 thiết bị"
                     });
-
                     return;
                 }
 
-                ws.id = crypto.randomUUID();
-                ws.room = data.room;
+                const oldTimer = targetRoom.memberTimers.get(deviceId);
+
+                if (oldTimer) {
+                    clearTimeout(oldTimer);
+                    targetRoom.memberTimers.delete(deviceId);
+                }
 
                 const existingMembers = [];
 
-                for (const member of targetRoom.members.values()) {
-                    existingMembers.push({
-                        id: member.id
-                    });
+                for (const [id, member] of targetRoom.members.entries()) {
+                    if (id !== deviceId && member) {
+                        existingMembers.push({ id });
+                    }
                 }
 
-                targetRoom.members.set(ws.id, ws);
+                targetRoom.members.set(deviceId, ws);
+
+                ws.id = deviceId;
+                ws.room = data.room;
 
                 sendJson(ws, {
                     type: "joined",
                     room: data.room,
-                    id: ws.id,
-                    members: existingMembers
+                    id: deviceId,
+                    members: existingMembers,
+                    restored: existingDevice,
+                    sharing: targetRoom.sharerId === deviceId
                 });
 
                 broadcast(targetRoom, {
                     type: "peer_joined",
-                    id: ws.id
+                    id: deviceId,
+                    restored: existingDevice
                 }, ws);
+
+                if (targetRoom.sharerId === deviceId) {
+                    sendJson(ws, {
+                        type: "share_granted"
+                    });
+                }
 
                 broadcastShareState(targetRoom);
                 break;
@@ -186,10 +275,10 @@ wss.on("connection", (ws) => {
                 }
 
                 if (
-                    room.sharer === null ||
-                    room.sharer === ws
+                    room.sharerId === null ||
+                    room.sharerId === ws.id
                 ) {
-                    room.sharer = ws;
+                    room.sharerId = ws.id;
 
                     sendJson(ws, {
                         type: "share_granted"
@@ -208,8 +297,8 @@ wss.on("connection", (ws) => {
             case "release": {
                 if (!room) return;
 
-                if (room.sharer === ws) {
-                    room.sharer = null;
+                if (room.sharerId === ws.id) {
+                    room.sharerId = null;
 
                     broadcast(room, {
                         type: "share_stopped",
@@ -237,7 +326,7 @@ wss.on("connection", (ws) => {
                 if (!target || target === ws) {
                     sendJson(ws, {
                         type: "error",
-                        message: "Thiết bị nhận không tồn tại"
+                        message: "Thiết bị nhận không tồn tại hoặc đang ngoại tuyến"
                     });
                     return;
                 }
@@ -258,7 +347,7 @@ wss.on("connection", (ws) => {
 
                 if (
                     data.signal.type === "offer" &&
-                    room.sharer !== ws
+                    room.sharerId !== ws.id
                 ) {
                     sendJson(ws, {
                         type: "error",
@@ -279,7 +368,7 @@ wss.on("connection", (ws) => {
             case "hide": {
                 if (!room) return;
 
-                if (room.sharer !== ws) {
+                if (room.sharerId !== ws.id) {
                     sendJson(ws, {
                         type: "error",
                         message: "Bạn không có quyền chia sẻ"
@@ -305,7 +394,7 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("close", () => {
-        leaveRoom(ws);
+        handleDisconnect(ws);
     });
 
     ws.on("error", (error) => {
