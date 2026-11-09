@@ -1,3 +1,4 @@
+
 const WebSocket = require("ws");
 const http = require("http");
 const crypto = require("crypto");
@@ -11,7 +12,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/plain"
     });
-    res.end("Share Map Signaling Server Online");
+    res.end("Share Map Server Online");
 });
 
 const wss = new WebSocket.Server({
@@ -111,7 +112,6 @@ function handleDisconnect(ws) {
 
     if (room.members.get(id) !== ws) return;
 
-    // Giữ chỗ thiết bị trong phòng để có thể kết nối lại.
     room.members.set(id, null);
 
     broadcast(room, {
@@ -150,11 +150,32 @@ wss.on("connection", (ws) => {
     ws.id = null;
 
     ws.on("message", (message, isBinary) => {
+
+        // VIDEO H.264 BINARY RELAY
         if (isBinary) {
-            sendJson(ws, {
-                type: "error",
-                message: "Server chỉ xử lý signaling, không nhận video"
-            });
+            const room = getRoom(ws);
+
+            if (
+                !room ||
+                !ws.id ||
+                room.sharerId !== ws.id ||
+                room.members.get(ws.id) !== ws
+            ) {
+                return;
+            }
+
+            for (const [id, client] of room.members.entries()) {
+                if (
+                    id !== ws.id &&
+                    client &&
+                    client.readyState === WebSocket.OPEN
+                ) {
+                    client.send(message, {
+                        binary: true
+                    });
+                }
+            }
+
             return;
         }
 
@@ -207,7 +228,8 @@ wss.on("connection", (ws) => {
                 }
 
                 const deviceId = data.deviceId;
-                const existingDevice = targetRoom.members.has(deviceId);
+                const existingDevice =
+                    targetRoom.members.has(deviceId);
 
                 if (
                     !existingDevice &&
@@ -220,7 +242,8 @@ wss.on("connection", (ws) => {
                     return;
                 }
 
-                const oldTimer = targetRoom.memberTimers.get(deviceId);
+                const oldTimer =
+                    targetRoom.memberTimers.get(deviceId);
 
                 if (oldTimer) {
                     clearTimeout(oldTimer);
@@ -394,6 +417,20 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("close", () => {
+        handleDisconnect(ws);
+    });
+
+    ws.on("error", (error) => {
+        console.error("WebSocket error:", error.message);
+    });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(
+        "Share Map Server running on port " + PORT
+    );
+});
+{
         handleDisconnect(ws);
     });
 
